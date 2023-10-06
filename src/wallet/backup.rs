@@ -39,34 +39,42 @@ struct CypherSecrets {
 }
 
 #[derive(Deserialize, Serialize)]
-struct ScryptParams {
+pub(crate) struct ScryptParams {
     log_n: u8,
     r: u32,
     p: u32,
     len: usize,
     salt: String,
 }
+
 impl ScryptParams {
-    fn new() -> ScryptParams {
+    pub(crate) fn new(log_n: Option<u8>, r: Option<u32>, p: Option<u32>) -> ScryptParams {
         let salt: String = rand::thread_rng()
             .sample_iter(&Alphanumeric)
             .take(BACKUP_KEY_LENGTH)
             .map(char::from)
             .collect();
         ScryptParams {
-            log_n: Params::RECOMMENDED_LOG_N,
-            r: Params::RECOMMENDED_R,
-            p: Params::RECOMMENDED_P,
+            log_n: log_n.unwrap_or(Params::RECOMMENDED_LOG_N),
+            r: r.unwrap_or(Params::RECOMMENDED_R),
+            p: p.unwrap_or(Params::RECOMMENDED_P),
             len: BACKUP_KEY_LENGTH,
             salt,
         }
     }
 }
+
+impl Default for ScryptParams {
+    fn default() -> ScryptParams {
+        ScryptParams::new(None, None, None)
+    }
+}
+
 impl TryInto<Params> for ScryptParams {
     type Error = Error;
     fn try_into(self: ScryptParams) -> Result<Params, Error> {
         Params::new(self.log_n, self.r, self.p, self.len).map_err(|e| Error::Internal {
-            details: format!("invalid params {}", e.to_string()),
+            details: format!("invalid params {}", e),
         })
     }
 }
@@ -79,6 +87,14 @@ impl Wallet {
     /// hashing and a random nonce for encrypting are randomly generated and included in the final
     /// backup file, along with the backup version
     pub fn backup(&self, backup_path: &str, password: &str) -> Result<(), Error> {
+        self.backup_custom_params(backup_path, password, None)
+    }
+    pub(crate) fn backup_custom_params(
+        &self,
+        backup_path: &str,
+        password: &str,
+        params: Option<ScryptParams>,
+    ) -> Result<(), Error> {
         // setup
         info!(self.logger, "starting backup...");
         let backup_file = PathBuf::from(&backup_path);
@@ -89,8 +105,8 @@ impl Wallet {
         }
         let tmp_base_path = _get_parent_path(&backup_file)?;
         let files = _get_backup_paths(&tmp_base_path)?;
-        let scrypt_params = ScryptParams::new();
-        let str_params = serde_json::to_string(&scrypt_params).map_err(InternalError::from)?;
+        let scrypt_params_ = params.unwrap_or(ScryptParams::default());
+        let str_params = serde_json::to_string(&scrypt_params_).map_err(InternalError::from)?;
         debug!(self.logger, "using generated scrypt params: {}", str_params);
         let nonce: String = rand::thread_rng()
             .sample_iter(&Alphanumeric)
@@ -115,7 +131,7 @@ impl Wallet {
             &files.zip,
             &files.encrypted,
             password,
-            scrypt_params,
+            scrypt_params_,
             &nonce,
         )?;
 
@@ -336,7 +352,7 @@ fn _get_cypher_secrets(
     let hash = hash_output.as_bytes();
 
     // get key from password hash
-    let key = Key::clone_from_slice(&hash);
+    let key = Key::clone_from_slice(hash);
 
     // get nonce from provided str
     let nonce_bytes = nonce_str.as_bytes();
