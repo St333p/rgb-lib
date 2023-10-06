@@ -27,7 +27,6 @@ const BACKUP_VERSION: u8 = 1;
 struct BackupPaths {
     encrypted: PathBuf,
     nonce: PathBuf,
-    salt: PathBuf,
     scrypt_params: PathBuf,
     tempdir: TempDir,
     version: PathBuf,
@@ -91,12 +90,8 @@ impl Wallet {
         let tmp_base_path = _get_parent_path(&backup_file)?;
         let files = _get_backup_paths(&tmp_base_path)?;
         let scrypt_params = ScryptParams::new();
-        let str_params = serde_json::to_string(&scrypt_params).unwrap();
-        debug!(
-            self.logger,
-            "using generated scrypt params: {}",
-            serde_json::to_string(&scrypt_params).unwrap()
-        );
+        let str_params = serde_json::to_string(&scrypt_params).map_err(InternalError::from)?;
+        debug!(self.logger, "using generated scrypt params: {}", str_params);
         let nonce: String = rand::thread_rng()
             .sample_iter(&Alphanumeric)
             .take(BACKUP_NONCE_LENGTH)
@@ -162,12 +157,10 @@ pub fn restore_backup(backup_path: &str, password: &str, target_dir: &str) -> Re
     _unzip(&backup_file, &PathBuf::from(files.tempdir.path()), &logger)?;
     let nonce = read_to_string(files.nonce)?;
     debug!(logger, "using retrieved nonce: {}", &nonce);
-    let salt = read_to_string(files.salt)?;
-    debug!(logger, "using retrieved salt: {}", &salt);
-    // TODO: refactor
-    let str_params = read_to_string(files.scrypt_params)?;
-    debug!(logger, "using retrieved scrypt_params: {}", str_params);
-    let scrypt_params: ScryptParams = serde_json::from_str(str_params.as_str()).unwrap();
+    let json_params = read_to_string(files.scrypt_params)?;
+    debug!(logger, "using retrieved scrypt_params: {}", json_params);
+    let scrypt_params: ScryptParams =
+        serde_json::from_str(json_params.as_str()).map_err(InternalError::from)?;
     let version = read_to_string(files.version)?
         .parse::<u8>()
         .map_err(|_| InternalError::Unexpected)?;
@@ -205,14 +198,12 @@ fn _get_backup_paths(tmp_base_path: &Path) -> Result<BackupPaths, Error> {
     let tempdir = tempfile::tempdir_in(tmp_base_path)?;
     let encrypted = tempdir.path().join("backup.enc");
     let nonce = tempdir.path().join("backup.nonce");
-    let salt = tempdir.path().join("backup.salt");
     let scrypt_params = tempdir.path().join("backup.scrypt_params");
     let version = tempdir.path().join("backup.version");
     let zip = tempdir.path().join("backup.zip");
     Ok(BackupPaths {
         encrypted,
         nonce,
-        salt,
         scrypt_params,
         tempdir,
         version,
