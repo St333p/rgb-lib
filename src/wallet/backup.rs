@@ -31,11 +31,6 @@ struct BackupPaths {
     zip: PathBuf,
 }
 
-struct CypherSecrets {
-    key: GenericArray<u8, U32>,
-    nonce: [u8; BACKUP_NONCE_LENGTH],
-}
-
 #[derive(Clone, Copy, Deserialize, Serialize)]
 pub(crate) struct ScryptParams {
     log_n: u8,
@@ -77,6 +72,21 @@ struct BackupPubData {
     salt: String,
     nonce: String,
     version: u8,
+}
+
+impl BackupPubData {
+    fn salt(&self) -> Result<Box<Salt>, InternalError> {
+        Ok(Box::new(
+            Salt::from_b64(&self.salt).map_err(InternalError::from)?,
+        ))
+    }
+
+    fn nonce(&self) -> Result<[u8; BACKUP_NONCE_LENGTH], InternalError> {
+        let nonce_bytes = self.nonce.as_bytes();
+        nonce_bytes[0..BACKUP_NONCE_LENGTH]
+            .try_into()
+            .map_err(|_| InternalError::Unexpected)
+    }
 }
 
 impl Wallet {
@@ -329,12 +339,11 @@ fn _unzip(zip_path: &PathBuf, path_out: &Path, logger: &Logger) -> Result<(), Er
 fn _get_cypher_secrets(
     password: &str,
     backup_pub_data: &BackupPubData,
-) -> Result<CypherSecrets, Error> {
+) -> Result<GenericArray<u8, U32>, Error> {
     // hash password using scrypt with the provided salt
     let password_bytes = password.as_bytes();
-    let salt = Salt::from_b64(&backup_pub_data.salt).map_err(InternalError::from)?;
+    let salt = *backup_pub_data.salt()?;
     let password_hash = Scrypt
-        // TODO: store version and alg_id as well
         .hash_password_customized(
             password_bytes,
             None,
@@ -351,13 +360,7 @@ fn _get_cypher_secrets(
     // get key from password hash
     let key = Key::clone_from_slice(hash);
 
-    // get nonce from provided str
-    let nonce_bytes = backup_pub_data.nonce.as_bytes();
-    let nonce: [u8; BACKUP_NONCE_LENGTH] = nonce_bytes[0..BACKUP_NONCE_LENGTH]
-        .try_into()
-        .map_err(|_| InternalError::Unexpected)?;
-
-    Ok(CypherSecrets { key, nonce })
+    Ok(key)
 }
 
 fn _encrypt_file(
@@ -366,14 +369,14 @@ fn _encrypt_file(
     password: &str,
     backup_pub_data: &BackupPubData,
 ) -> Result<(), Error> {
-    let cypher_secrets = _get_cypher_secrets(password, backup_pub_data)?;
+    let key = _get_cypher_secrets(password, backup_pub_data)?;
 
     // - XChacha20Poly1305 is fast, requires no special hardware and supports stream operation
     // - stream mode required as files to encrypt may be big, so avoiding a memory buffer
 
     // setup
-    let aead = XChaCha20Poly1305::new(&cypher_secrets.key);
-    let nonce = GenericArray::from_slice(&cypher_secrets.nonce);
+    let aead = XChaCha20Poly1305::new(&key);
+    let nonce = GenericArray::from_slice(&backup_pub_data.nonce()?);
     let mut stream_encryptor = stream::EncryptorBE32::from_aead(aead, nonce);
     let mut buffer = [0u8; BACKUP_BUFFER_LEN_ENCRYPT];
     let mut source_file = File::open(path_cleartext)?;
