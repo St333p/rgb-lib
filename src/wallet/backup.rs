@@ -1,8 +1,10 @@
 use chacha20poly1305::aead::{generic_array::GenericArray, stream};
 use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305};
 use rand::{distributions::Alphanumeric, Rng};
-use scrypt::password_hash::{ParamsString, PasswordHasher, Salt};
+use scrypt::errors::InvalidParams;
+use scrypt::password_hash::{PasswordHasher, Salt};
 use scrypt::{Params, Scrypt};
+use serde::{Deserialize, Serialize};
 use slog::Logger;
 use tempfile::TempDir;
 use typenum::consts::U32;
@@ -12,7 +14,6 @@ use zip::write::FileOptions;
 use std::fs::{create_dir_all, read_to_string, remove_file, write, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 
 use crate::utils::now;
 use crate::wallet::{setup_logger, InternalError, LOG_FILE};
@@ -37,6 +38,34 @@ struct BackupPaths {
 struct CypherSecrets {
     key: GenericArray<u8, U32>,
     nonce: [u8; BACKUP_NONCE_LENGTH],
+}
+
+#[derive(Deserialize, Serialize)]
+struct ScryptParams {
+    log_n: u8,
+    r: u32,
+    p: u32,
+    len: usize,
+    salt: String,
+}
+impl ScryptParams {
+    fn from_params_salt(params: Params, salt: String) -> Result<ScryptParams, InvalidParams> {
+        Ok(ScryptParams {
+            log_n: params.log_n(),
+            r: params.r(),
+            p: params.p(),
+            len: Params::RECOMMENDED_LEN, // FIXME
+            salt,
+        })
+    }
+}
+impl TryInto<Params> for ScryptParams {
+    type Error = Error;
+    fn try_into(self: ScryptParams) -> Result<Params, Error> {
+        Params::new(self.log_n, self.r, self.p, self.len).map_err(|e| Error::Internal {
+            details: format!("invalid params {}", e.to_string()),
+        })
+    }
 }
 
 impl Wallet {
@@ -94,9 +123,11 @@ impl Wallet {
 
         // add backup nonce + salt + version to final zip file
         write(files.nonce, nonce)?;
-        write(files.salt, salt)?;
-        let str_params: String = ParamsString::try_from(scrypt_params).unwrap().to_string();
-        write(files.scrypt_params, str_params)?;
+        let scrypt_params = &ScryptParams::from_params_salt(scrypt_params, salt).unwrap();
+        write(
+            files.scrypt_params,
+            serde_json::to_string(scrypt_params).unwrap(),
+        )?;
         write(files.version, BACKUP_VERSION.to_string())?;
         debug!(
             self.logger,
@@ -135,12 +166,9 @@ pub fn restore_backup(backup_path: &str, password: &str, target_dir: &str) -> Re
     let salt = read_to_string(files.salt)?;
     debug!(logger, "using retrieved salt: {}", &salt);
     // TODO: refactor
-    let str_params = ParamsString::from_str(read_to_string(files.scrypt_params)?.as_str()).unwrap();
-    let log_n = str_params.get_decimal("ln").unwrap();
-    let r = str_params.get_decimal("r").unwrap();
-    let p = str_params.get_decimal("p").unwrap();
-    let scrypt_params: Params = Params::new(log_n as u8, r, p, BACKUP_KEY_LENGTH).unwrap();
-    debug!(logger, "using retrieved scrypt_params: {}", &str_params);
+    let str_params: &str = read_to_string(files.scrypt_params)?.as_str();
+    debug!(logger, "using retrieved scrypt_params: {}", str_params);
+    let scrypt_params: ScryptParams = serde_json::from_str(str_params).unwrap();
     let version = read_to_string(files.version)?
         .parse::<u8>()
         .map_err(|_| InternalError::Unexpected)?;
@@ -160,8 +188,8 @@ pub fn restore_backup(backup_path: &str, password: &str, target_dir: &str) -> Re
         &files.encrypted,
         &files.zip,
         password,
-        &salt,
-        scrypt_params,
+        &scrypt_params.salt,
+        scrypt_params.try_into()?,
         &nonce,
     )?;
     info!(
