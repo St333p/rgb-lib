@@ -1,7 +1,7 @@
 use chacha20poly1305::aead::{generic_array::GenericArray, stream};
 use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305};
 use rand::{distributions::Alphanumeric, Rng};
-use scrypt::password_hash::{PasswordHasher, Salt};
+use scrypt::password_hash::{Decimal, Ident, PasswordHasher, Salt};
 use scrypt::{Params, Scrypt};
 use serde::{Deserialize, Serialize};
 use slog::Logger;
@@ -31,21 +31,28 @@ struct BackupPaths {
     zip: PathBuf,
 }
 
-#[derive(Clone, Copy, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct ScryptParams {
     log_n: u8,
     r: u32,
     p: u32,
     len: usize,
+    version: Option<Decimal>,
+    algorithm: String,
 }
 
 impl ScryptParams {
     pub(crate) fn new(log_n: Option<u8>, r: Option<u32>, p: Option<u32>) -> ScryptParams {
+        let dummy_password_hash = Scrypt
+            .hash_password("dummy_psw".as_bytes(), Salt::from_b64("dummysalt").unwrap())
+            .unwrap();
         ScryptParams {
             log_n: log_n.unwrap_or(Params::RECOMMENDED_LOG_N),
             r: r.unwrap_or(Params::RECOMMENDED_R),
             p: p.unwrap_or(Params::RECOMMENDED_P),
             len: BACKUP_KEY_LENGTH,
+            version: dummy_password_hash.version,
+            algorithm: dummy_password_hash.algorithm.to_string(),
         }
     }
 }
@@ -346,8 +353,8 @@ fn _get_cypher_secrets(
     let password_hash = Scrypt
         .hash_password_customized(
             password_bytes,
-            None,
-            None,
+            Some(Ident::try_from(backup_pub_data.scrypt_params.algorithm)), //FIXME
+            backup_pub_data.scrypt_params.version,
             backup_pub_data.scrypt_params.try_into()?,
             salt,
         )
@@ -376,7 +383,8 @@ fn _encrypt_file(
 
     // setup
     let aead = XChaCha20Poly1305::new(&key);
-    let nonce = GenericArray::from_slice(&backup_pub_data.nonce()?);
+    let nonce = backup_pub_data.nonce()?;
+    let nonce = GenericArray::from_slice(&nonce);
     let mut stream_encryptor = stream::EncryptorBE32::from_aead(aead, nonce);
     let mut buffer = [0u8; BACKUP_BUFFER_LEN_ENCRYPT];
     let mut source_file = File::open(path_cleartext)?;
@@ -411,11 +419,12 @@ fn _decrypt_file(
     password: &str,
     backup_pub_data: &BackupPubData,
 ) -> Result<(), Error> {
-    let cypher_secrets = _get_cypher_secrets(password, backup_pub_data)?;
+    let key = _get_cypher_secrets(password, backup_pub_data)?;
 
     // setup
-    let aead = XChaCha20Poly1305::new(&cypher_secrets.key);
-    let nonce = GenericArray::from_slice(&cypher_secrets.nonce);
+    let aead = XChaCha20Poly1305::new(&key);
+    let nonce = backup_pub_data.nonce()?;
+    let nonce = GenericArray::from_slice(&nonce);
     let mut stream_decryptor = stream::DecryptorBE32::from_aead(aead, nonce);
     let mut buffer = [0u8; BACKUP_BUFFER_LEN_DECRYPT];
     let mut source_file = File::open(path_encrypted)?;
