@@ -336,7 +336,7 @@ fn _get_cypher_secrets(
     let hash = hash_output.as_bytes();
 
     // get key from password hash
-    let key = Key::clone_from_slice(&hash[..BACKUP_KEY_LENGTH]);
+    let key = Key::clone_from_slice(&hash);
 
     // get nonce from provided str
     let nonce_bytes = nonce_str.as_bytes();
