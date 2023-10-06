@@ -1,7 +1,6 @@
 use chacha20poly1305::aead::{generic_array::GenericArray, stream};
 use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305};
 use rand::{distributions::Alphanumeric, Rng};
-use scrypt::errors::InvalidParams;
 use scrypt::password_hash::{PasswordHasher, Salt};
 use scrypt::{Params, Scrypt};
 use serde::{Deserialize, Serialize};
@@ -49,14 +48,19 @@ struct ScryptParams {
     salt: String,
 }
 impl ScryptParams {
-    fn from_params_salt(params: Params, salt: String) -> Result<ScryptParams, InvalidParams> {
-        Ok(ScryptParams {
-            log_n: params.log_n(),
-            r: params.r(),
-            p: params.p(),
-            len: Params::RECOMMENDED_LEN, // FIXME
+    fn new() -> ScryptParams {
+        let salt: String = rand::thread_rng()
+            .sample_iter(&Alphanumeric)
+            .take(BACKUP_KEY_LENGTH)
+            .map(char::from)
+            .collect();
+        ScryptParams {
+            log_n: Params::RECOMMENDED_LOG_N,
+            r: Params::RECOMMENDED_R,
+            p: Params::RECOMMENDED_P,
+            len: BACKUP_KEY_LENGTH,
             salt,
-        })
+        }
     }
 }
 impl TryInto<Params> for ScryptParams {
@@ -86,13 +90,13 @@ impl Wallet {
         }
         let tmp_base_path = _get_parent_path(&backup_file)?;
         let files = _get_backup_paths(&tmp_base_path)?;
-        let salt: String = rand::thread_rng()
-            .sample_iter(&Alphanumeric)
-            .take(BACKUP_KEY_LENGTH)
-            .map(char::from)
-            .collect();
-        let scrypt_params = Params::default();
-        debug!(self.logger, "using generated salt: {}", &salt);
+        let scrypt_params = ScryptParams::new();
+        let str_params = serde_json::to_string(&scrypt_params).unwrap();
+        debug!(
+            self.logger,
+            "using generated scrypt params: {}",
+            serde_json::to_string(&scrypt_params).unwrap()
+        );
         let nonce: String = rand::thread_rng()
             .sample_iter(&Alphanumeric)
             .take(BACKUP_NONCE_LENGTH)
@@ -116,18 +120,13 @@ impl Wallet {
             &files.zip,
             &files.encrypted,
             password,
-            &salt,
             scrypt_params,
             &nonce,
         )?;
 
         // add backup nonce + salt + version to final zip file
         write(files.nonce, nonce)?;
-        let scrypt_params = &ScryptParams::from_params_salt(scrypt_params, salt).unwrap();
-        write(
-            files.scrypt_params,
-            serde_json::to_string(scrypt_params).unwrap(),
-        )?;
+        write(files.scrypt_params, str_params)?;
         write(files.version, BACKUP_VERSION.to_string())?;
         debug!(
             self.logger,
@@ -166,9 +165,9 @@ pub fn restore_backup(backup_path: &str, password: &str, target_dir: &str) -> Re
     let salt = read_to_string(files.salt)?;
     debug!(logger, "using retrieved salt: {}", &salt);
     // TODO: refactor
-    let str_params: &str = read_to_string(files.scrypt_params)?.as_str();
+    let str_params = read_to_string(files.scrypt_params)?;
     debug!(logger, "using retrieved scrypt_params: {}", str_params);
-    let scrypt_params: ScryptParams = serde_json::from_str(str_params).unwrap();
+    let scrypt_params: ScryptParams = serde_json::from_str(str_params.as_str()).unwrap();
     let version = read_to_string(files.version)?
         .parse::<u8>()
         .map_err(|_| InternalError::Unexpected)?;
@@ -188,8 +187,7 @@ pub fn restore_backup(backup_path: &str, password: &str, target_dir: &str) -> Re
         &files.encrypted,
         &files.zip,
         password,
-        &scrypt_params.salt,
-        scrypt_params.try_into()?,
+        scrypt_params,
         &nonce,
     )?;
     info!(
@@ -330,16 +328,16 @@ fn _unzip(zip_path: &PathBuf, path_out: &Path, logger: &Logger) -> Result<(), Er
 
 fn _get_cypher_secrets(
     password: &str,
-    salt_str: &str,
-    scrypt_params: <Scrypt as PasswordHasher>::Params,
+    scrypt_params: ScryptParams,
     nonce_str: &str,
 ) -> Result<CypherSecrets, Error> {
     // hash password using scrypt with the provided salt
     let password_bytes = password.as_bytes();
-    let salt = Salt::from_b64(salt_str).map_err(InternalError::from)?;
+    let salt_str = scrypt_params.salt.clone();
+    let salt = Salt::from_b64(&salt_str).map_err(InternalError::from)?;
     let password_hash = Scrypt
         // Version is currently unsupported, need to store it as well if this changes
-        .hash_password_customized(password_bytes, None, None, scrypt_params, salt)
+        .hash_password_customized(password_bytes, None, None, scrypt_params.try_into()?, salt)
         .map_err(InternalError::from)?;
     let hash_output = password_hash
         .hash
@@ -362,11 +360,10 @@ fn _encrypt_file(
     path_cleartext: &PathBuf,
     path_encrypted: &PathBuf,
     password: &str,
-    salt_str: &str,
-    scrypt_params: Params,
+    scrypt_params: ScryptParams,
     nonce_str: &str,
 ) -> Result<(), Error> {
-    let cypher_secrets = _get_cypher_secrets(password, salt_str, scrypt_params, nonce_str)?;
+    let cypher_secrets = _get_cypher_secrets(password, scrypt_params, nonce_str)?;
 
     // - XChacha20Poly1305 is fast, requires no special hardware and supports stream operation
     // - stream mode required as files to encrypt may be big, so avoiding a memory buffer
@@ -406,11 +403,10 @@ fn _decrypt_file(
     path_encrypted: &PathBuf,
     path_cleartext: &PathBuf,
     password: &str,
-    salt_str: &str,
-    scrypt_params: <Scrypt as PasswordHasher>::Params,
+    scrypt_params: ScryptParams,
     nonce_str: &str,
 ) -> Result<(), Error> {
-    let cypher_secrets = _get_cypher_secrets(password, salt_str, scrypt_params, nonce_str)?;
+    let cypher_secrets = _get_cypher_secrets(password, scrypt_params, nonce_str)?;
 
     // setup
     let aead = XChaCha20Poly1305::new(&cypher_secrets.key);
