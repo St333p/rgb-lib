@@ -1,7 +1,7 @@
 use chacha20poly1305::aead::{generic_array::GenericArray, stream};
 use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305};
 use rand::{distributions::Alphanumeric, Rng};
-use scrypt::password_hash::{PasswordHasher, Salt};
+use scrypt::password_hash::{PasswordHasher, Salt, SaltString};
 use scrypt::{Params, Scrypt};
 use serde::{Deserialize, Serialize};
 use slog::Logger;
@@ -31,12 +31,14 @@ struct BackupPaths {
     zip: PathBuf,
 }
 
-#[derive(Clone, Copy, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct ScryptParams {
     log_n: u8,
     r: u32,
     p: u32,
     len: usize,
+    version: Option<u32>,
+    algorithm: Option<String>,
 }
 
 impl ScryptParams {
@@ -46,6 +48,8 @@ impl ScryptParams {
             r: r.unwrap_or(Params::RECOMMENDED_R),
             p: p.unwrap_or(Params::RECOMMENDED_P),
             len: BACKUP_KEY_LENGTH,
+            version: None,
+            algorithm: None,
         }
     }
 }
@@ -100,6 +104,10 @@ impl Wallet {
         self.backup_customize(backup_path, password, None)
     }
 
+    /// For now this method is only used for testing, a few details should be refined before
+    /// exposing it to the public:
+    /// - Which parameters should we allow users to change? Should we set sensible minimums?
+    /// - Can we guarantee old backups can always be recovered in the future?
     pub(crate) fn backup_customize(
         &self,
         backup_path: &str,
@@ -117,11 +125,8 @@ impl Wallet {
         let tmp_base_path = _get_parent_path(&backup_file)?;
         let files = _get_backup_paths(&tmp_base_path)?;
         let scrypt_params = scrypt_params.unwrap_or(ScryptParams::default());
-        let salt: String = rand::thread_rng()
-            .sample_iter(&Alphanumeric)
-            .take(BACKUP_KEY_LENGTH)
-            .map(char::from)
-            .collect();
+        let mut rng = rand::thread_rng();
+        let salt = SaltString::generate(&mut rng);
         let str_params = serde_json::to_string(&scrypt_params).map_err(InternalError::from)?;
         debug!(self.logger, "using generated scrypt params: {}", str_params);
         let nonce: String = rand::thread_rng()
@@ -132,7 +137,7 @@ impl Wallet {
         debug!(self.logger, "using generated nonce: {}", &nonce);
         let backup_pub_data = BackupPubData {
             scrypt_params,
-            salt,
+            salt: salt.to_string(),
             nonce,
             version: BACKUP_VERSION,
         };
@@ -348,7 +353,7 @@ fn _get_cypher_secrets(
             password_bytes,
             None,
             None,
-            backup_pub_data.scrypt_params.try_into()?,
+            backup_pub_data.scrypt_params.clone().try_into()?,
             salt,
         )
         .map_err(InternalError::from)?;
@@ -376,7 +381,8 @@ fn _encrypt_file(
 
     // setup
     let aead = XChaCha20Poly1305::new(&key);
-    let nonce = GenericArray::from_slice(&backup_pub_data.nonce()?);
+    let nonce = backup_pub_data.nonce()?;
+    let nonce = GenericArray::from_slice(&nonce);
     let mut stream_encryptor = stream::EncryptorBE32::from_aead(aead, nonce);
     let mut buffer = [0u8; BACKUP_BUFFER_LEN_ENCRYPT];
     let mut source_file = File::open(path_cleartext)?;
@@ -411,11 +417,12 @@ fn _decrypt_file(
     password: &str,
     backup_pub_data: &BackupPubData,
 ) -> Result<(), Error> {
-    let cypher_secrets = _get_cypher_secrets(password, backup_pub_data)?;
+    let key = _get_cypher_secrets(password, backup_pub_data)?;
 
     // setup
-    let aead = XChaCha20Poly1305::new(&cypher_secrets.key);
-    let nonce = GenericArray::from_slice(&cypher_secrets.nonce);
+    let aead = XChaCha20Poly1305::new(&key);
+    let nonce = backup_pub_data.nonce()?;
+    let nonce = GenericArray::from_slice(&nonce);
     let mut stream_decryptor = stream::DecryptorBE32::from_aead(aead, nonce);
     let mut buffer = [0u8; BACKUP_BUFFER_LEN_DECRYPT];
     let mut source_file = File::open(path_encrypted)?;
