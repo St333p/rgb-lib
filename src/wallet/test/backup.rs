@@ -287,7 +287,7 @@ fn double_restore() {
     wallet_1.backup(&backup_file_1, password_1).unwrap();
     let custom_params = ScryptParams::new(Some(16u8), Some(7u32), Some(2u32));
     wallet_2
-        .backup_customize(&backup_file_2, password_2, Some(custom_params))
+        .backup_customized(&backup_file_2, password_2, Some(custom_params))
         .unwrap();
 
     // drop wallets
